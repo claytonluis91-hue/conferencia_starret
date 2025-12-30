@@ -11,13 +11,36 @@ Esta ferramenta processa o arquivo fiscal, separa **Entradas e Saídas** pelo CF
 e agrupa os valores de ICMS baseados no CST (Código de Situação Tributária).
 """)
 
+# Função Inteligente de Conversão de Moeda
+def converter_moeda_smart(valor):
+    """
+    Identifica se o valor é Brasileiro (com vírgula) ou Internacional (com ponto)
+    e converte corretamente para float.
+    """
+    if pd.isna(valor):
+        return 0.0
+        
+    s = str(valor).strip()
+    
+    # Caso 1: Formato Brasileiro (Ex: 1.500,25 ou 200,50)
+    if ',' in s:
+        s = s.replace('.', '')  # Remove ponto de milhar (1.500 -> 1500)
+        s = s.replace(',', '.') # Troca vírgula por ponto decimal (1500,25 -> 1500.25)
+        
+    # Caso 2: Já está em formato internacional ou numérico simples (Ex: 1500.25 ou 64.16)
+    # Nenhuma ação de replace é necessária, o pd.to_numeric resolve.
+    
+    try:
+        return float(s)
+    except ValueError:
+        return 0.0
+
 # Upload do arquivo
 uploaded_file = st.file_uploader("Carregue seu arquivo CSV ou Excel", type=["csv", "xlsx"])
 
 if uploaded_file:
     try:
         # --- CARREGAMENTO DO ARQUIVO ---
-        # Tenta ler como CSV (com diferentes encodings) ou Excel
         if uploaded_file.name.endswith('.csv'):
             try:
                 df = pd.read_csv(uploaded_file, encoding='latin1', sep=',')
@@ -31,32 +54,28 @@ if uploaded_file:
 
         # --- TRATAMENTO DOS DADOS ---
         
-        # 1. Ajuste de colunas numéricas (Blindagem contra erros de formatação R$)
-        # Converte textos como "1.200,50" para o número 1200.50 que o Python entende
+        # 1. Ajuste de colunas numéricas usando a função inteligente
         cols_valores = ['VLR_CONTAB_ITEM', 'VLR_BASE_ICMS_1', 'VLR_TRIBUTO_ICMS']
         
-        # Verificamos se as colunas existem antes de tentar converter
+        # Filtra apenas as colunas que realmente existem no arquivo
         cols_existentes = [col for col in cols_valores if col in df.columns]
         
         for col in cols_existentes:
-            # Garante que é string primeiro
-            df[col] = df[col].astype(str)
-            # Remove ponto de milhar (ex: 1.000 -> 1000)
-            df[col] = df[col].str.replace('.', '', regex=False)
-            # Troca vírgula por ponto decimal (ex: 50,20 -> 50.20)
-            df[col] = df[col].str.replace(',', '.', regex=False)
-            # Converte para número (se der erro, vira 0)
-            df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0.0)
+            # Aplica a função linha a linha para garantir precisão
+            df[col] = df[col].apply(converter_moeda_smart)
 
         # 2. Definição de colunas de metadados
         col_cfop = 'COD_CFO'
         col_cst_a = 'COD_SITUACAO_A' # Origem
         col_cst_b = 'COD_SITUACAO_B' # Tributação
         
-        # 3. Cria CST Completo (Ex: 0 + 00 = 000)
-        # Garante que as colunas de CST sejam strings antes de concatenar
-        df['CST_COMPLETO'] = df[col_cst_a].astype(str).str.replace(r'\.0$', '', regex=True) + \
-                             df[col_cst_b].astype(str).str.replace(r'\.0$', '', regex=True).str.zfill(2)
+        # 3. Cria CST Completo (Tratamento para remover .0 de inteiros que viraram float)
+        def limpar_cst(valor):
+            if pd.isna(valor): return ""
+            return str(valor).replace('.0', '').strip()
+
+        df['CST_COMPLETO'] = df[col_cst_a].apply(limpar_cst) + \
+                             df[col_cst_b].apply(limpar_cst).str.zfill(2)
         
         # 4. Lógica de Entrada vs Saída baseada no CFOP
         def definir_tipo(cfop):
@@ -77,16 +96,13 @@ if uploaded_file:
         with tab1:
             st.header("Totais por Tipo de Operação")
             
-            # Agrupa por tipo e soma
             resumo_tipo = df.groupby('TIPO_OPERACAO')[cols_existentes].sum().reset_index()
             
-            # Mostra tabela formatada
+            # Formatação visual
             st.dataframe(resumo_tipo.style.format({col: "R$ {:,.2f}" for col in cols_existentes}))
 
-            # Métricas (Cards)
             col1, col2 = st.columns(2)
             
-            # Filtra valores para os cards, garantindo que não quebre se estiver vazio
             mask_ent = resumo_tipo['TIPO_OPERACAO'] == 'ENTRADA'
             mask_sai = resumo_tipo['TIPO_OPERACAO'] == 'SAIDA'
             
@@ -110,7 +126,6 @@ if uploaded_file:
                 st.subheader(f"ICMS por CST ({tipo_filtro})")
                 st.dataframe(analise_cst.style.format({col: "R$ {:,.2f}" for col in cols_existentes}), use_container_width=True)
 
-                # Botão de Download
                 csv = analise_cst.to_csv(index=False).encode('utf-8')
                 st.download_button(
                     label=f"Baixar Relatório CST ({tipo_filtro})",
@@ -122,9 +137,8 @@ if uploaded_file:
                 st.info(f"Nenhum registro de {tipo_filtro} encontrado.")
 
         with tab3:
-            st.write("Amostra dos dados processados:")
+            st.write("Amostra dos dados processados (Verifique as colunas de valores):")
             st.dataframe(df.head())
 
     except Exception as e:
         st.error(f"Erro ao processar o arquivo: {e}")
-        st.write("Dica: Verifique se o arquivo possui as colunas 'COD_CFO', 'COD_SITUACAO_A', 'COD_SITUACAO_B' e colunas de valores.")
