@@ -92,7 +92,6 @@ class ProcessadorFiscal:
         tts = df[df['TIPO_OPERACAO'] == 'SAIDA'].copy()
         
         # Lógica para identificar produtos elegíveis (CST Origem 1, 6 ou 2, 7)
-        # Assumindo que o regime é para importados
         if 'COD_SITUACAO_A' in tts.columns:
             tts['ELEGIVEL_TTS'] = tts['COD_SITUACAO_A'].isin(['1', '6', '2', '7'])
         else:
@@ -104,29 +103,22 @@ class ProcessadorFiscal:
                 ncm_str = str(ncm).replace('.', '')
                 for prefixo in self.ncm_negativos_prefixo:
                     if ncm_str.startswith(prefixo):
-                        return False # Está na lista negativa, não é elegível
+                        return False # Está na lista negativa
                 return True
             
             tts['NCM_VALIDO'] = tts['COD_NBM'].apply(verifica_negativo)
             tts['ELEGIVEL_TTS'] = tts['ELEGIVEL_TTS'] & tts['NCM_VALIDO']
 
         # Cálculo do Crédito Presumido
-        # Regra Geral (Art 9, I):
-        # Interestadual (4%) -> Crédito 2.5%
-        # Interna (<=18%) -> Crédito 4%
-        # Interna (>18%) -> Crédito 5%
-        
         tts['CREDITO_PRESUMIDO_CALC'] = 0.0
         tts['ICMS_EFETIVO_RECOLHER'] = 0.0
         
-        # Garante que UF existe, senão assume MG
         uf_col = 'ESTADO_UF_FORNEC'
         if uf_col not in tts.columns:
             tts[uf_col] = 'MG'
 
         for index, row in tts.iterrows():
             if not row['ELEGIVEL_TTS']:
-                # Se não é elegível, o imposto é o débito normal (sem crédito presumido)
                 tts.at[index, 'ICMS_EFETIVO_RECOLHER'] = row['VLR_TRIBUTO_ICMS']
                 continue
 
@@ -136,44 +128,79 @@ class ProcessadorFiscal:
             debito = row['VLR_TRIBUTO_ICMS']
             credito_presumido = 0.0
 
-            # Lógica MG (Corredor)
             if uf != 'MG': # Interestadual
                 if aliq == 4:
                     credito_presumido = base * 0.025
-                # Se for CAMEX (alíquota 12% ou 7% não se aplica aqui pela regra I-a, mas mantemos 0 se não casar)
             else: # Interna MG
                 if aliq <= 18:
                     credito_presumido = base * 0.04
                 else:
                     credito_presumido = base * 0.05
             
-            # Ajuste final
             tts.at[index, 'CREDITO_PRESUMIDO_CALC'] = credito_presumido
-            # O imposto a recolher é o Débito da Saída - Crédito Presumido
-            # (Lembrando que o crédito da entrada foi estornado/diferido)
             imposto_final = debito - credito_presumido
             tts.at[index, 'ICMS_EFETIVO_RECOLHER'] = imposto_final if imposto_final > 0 else 0
 
         return tts
 
     def obter_divergencias(self):
-        # (Código Mantido igual ao anterior)
+        """Regras de validação de negócio (Atualizado)."""
         if not hasattr(self, 'df_processado'): self.processar_dados()
-        df = self.df_processado
+        df = self.df_processado.copy()
+        
+        lista_divergencias = []
+
+        # --- REGRA 1: CST Tributado sem ICMS ---
         saidas = df[df['TIPO_OPERACAO'] == 'SAIDA']
         csts_tributados = ['00', '10', '20', '70']
-        mask_cst = saidas['CST_COMPLETO'].str[-2:].isin(csts_tributados)
-        mask_valor = saidas['VLR_TRIBUTO_ICMS'] <= 0.01
-        div_valor = saidas[mask_cst & mask_valor].copy()
-        if not div_valor.empty: div_valor['MOTIVO_DIVERGENCIA'] = 'CST Tributado com ICMS Zerado'
+        mask_cst_trib = saidas['CST_COMPLETO'].str[-2:].isin(csts_tributados)
+        mask_valor_zerado = saidas['VLR_TRIBUTO_ICMS'] <= 0.01
+        
+        div_valor = saidas[mask_cst_trib & mask_valor_zerado].copy()
+        if not div_valor.empty:
+            div_valor['MOTIVO_DIVERGENCIA'] = 'CST Tributado com ICMS Zerado'
+            lista_divergencias.append(div_valor)
+
+        # --- REGRA 2: Cadastro incompleto em 5102/6102 ---
         target_cfops = ['5102', '6102']
-        mask_cfop = df['CFOP_LIMPO'].isin(target_cfops)
+        mask_cfop_cad = df['CFOP_LIMPO'].isin(target_cfops)
         def is_empty(series): return (series.isna()) | (series.astype(str).str.strip() == '') | (series == 0)
         mask_nat = is_empty(df['COD_NATUREZA_OP']) if 'COD_NATUREZA_OP' in df.columns else True
         mask_cst_b = is_empty(df['COD_SITUACAO_B']) if 'COD_SITUACAO_B' in df.columns else True
-        div_cadastro = df[mask_cfop & (mask_nat | mask_cst_b)].copy()
-        if not div_cadastro.empty: div_cadastro['MOTIVO_DIVERGENCIA'] = 'CFOP 5102/6102 com Natureza ou CST vazios'
-        return pd.concat([div_valor, div_cadastro]).drop_duplicates()
+        
+        div_cadastro = df[mask_cfop_cad & (mask_nat | mask_cst_b)].copy()
+        if not div_cadastro.empty:
+            div_cadastro['MOTIVO_DIVERGENCIA'] = 'CFOP 5102/6102 com Natureza ou CST vazios'
+            lista_divergencias.append(div_cadastro)
+
+        # --- NOVA REGRA 3: CFOP 5403/6403 deve ter CST 10 ---
+        # Filtra CFOPs de ST
+        mask_cfop_st = df['CFOP_LIMPO'].isin(['5403', '6403'])
+        # Filtra CSTs que NÃO terminam em 10
+        mask_cst_errado = ~df['CST_COMPLETO'].str.endswith('10')
+        
+        div_st = df[mask_cfop_st & mask_cst_errado].copy()
+        if not div_st.empty:
+            div_st['MOTIVO_DIVERGENCIA'] = 'CFOP 5.403/6.403 com CST incorreto (Esperado 10)'
+            lista_divergencias.append(div_st)
+
+        # --- NOVA REGRA 4: CST 20 deve ter Redução de Base ---
+        # Filtra CST terminado em 20
+        mask_cst_20 = df['CST_COMPLETO'].str.endswith('20')
+        # Verifica se Base >= Valor do Item (considerando pequena margem de erro float)
+        # Se a Base for igual ou maior, não houve redução.
+        mask_sem_reducao = df['VLR_BASE_ICMS_1'] >= (df['VLR_CONTAB_ITEM'] - 0.01)
+        
+        div_reducao = df[mask_cst_20 & mask_sem_reducao].copy()
+        if not div_reducao.empty:
+            div_reducao['MOTIVO_DIVERGENCIA'] = 'CST 20 sem Redução de Base de Cálculo (Base >= Valor Item)'
+            lista_divergencias.append(div_reducao)
+
+        # Consolidação
+        if lista_divergencias:
+            return pd.concat(lista_divergencias).drop_duplicates()
+        else:
+            return pd.DataFrame()
 
     def gerar_excel_consolidado(self):
         """Gera Excel com abas de apuração e TTS."""
@@ -212,8 +239,7 @@ class ProcessadorFiscal:
                 sheet_pc = 'Apuracao PIS_COFINS'
                 resumo_pc.to_excel(writer, sheet_name=sheet_pc, index=False)
 
-            # 4. NOVA ABA: Apuração TTS (Regime Especial)
-            # Filtra apenas colunas relevantes para o relatório
+            # 4. Apuração TTS (Regime Especial)
             cols_tts = ['COD_CFO', 'DATA_FISCAL', 'NUM_DOCFIS', 'RAZAO_SOCIAL', 'COD_NBM', 'CST_COMPLETO', 
                         'ESTADO_UF_FORNEC', 'VLR_CONTAB_ITEM', 'VLR_BASE_ICMS_1', 'ALIQ_TRIBUTO_ICMS',
                         'VLR_TRIBUTO_ICMS', 'ELEGIVEL_TTS', 'CREDITO_PRESUMIDO_CALC', 'ICMS_EFETIVO_RECOLHER']
@@ -230,7 +256,6 @@ class ProcessadorFiscal:
             
             df_tts_final.to_excel(writer, sheet_name=sheet_tts, startrow=3, index=False)
             
-            # Resumo do TTS
             total_debito_tts = df_tts[df_tts['ELEGIVEL_TTS']]['VLR_TRIBUTO_ICMS'].sum()
             total_credito_presumido = df_tts['CREDITO_PRESUMIDO_CALC'].sum()
             total_a_pagar = df_tts[df_tts['ELEGIVEL_TTS']]['ICMS_EFETIVO_RECOLHER'].sum()
@@ -247,5 +272,7 @@ class ProcessadorFiscal:
             divergencias = self.obter_divergencias()
             if not divergencias.empty:
                 divergencias.to_excel(writer, sheet_name='Divergencias', index=False)
+            else:
+                 pd.DataFrame({'Status': ['Nenhuma divergência encontrada']}).to_excel(writer, sheet_name='Divergencias', index=False)
 
         return output.getvalue()
